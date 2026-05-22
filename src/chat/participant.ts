@@ -55,7 +55,8 @@ function buildHistoryMessages(
   const msgs: vscode.LanguageModelChatMessage[] = [];
   let totalChars = 0;
 
-  // Walk history newest-first so we can drop oldest turns when over budget
+  // Convert history in its natural order, then walk `entries` backward below
+  // so we keep the most recent turns while dropping older ones when over budget.
   const entries: vscode.LanguageModelChatMessage[] = [];
   for (const turn of history) {
     if ('prompt' in turn) {
