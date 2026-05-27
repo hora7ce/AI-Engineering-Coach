@@ -6,10 +6,10 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { reconstructFromJsonl } from './parser-vscode-files';
 import { parseCLIEventsFile } from './parser-vscode-cli';
-import { parseSessionFile, harnessFromPath, findVsCodeDirs, scanVsCodeDirs } from './parser-vscode';
+import { parseSessionFile, harnessFromPath, findVsCodeDirs, scanVsCodeDirs, parseTranscriptFile } from './parser-vscode';
 
 function withTempFile(name: string, content: string, run: (filePath: string) => void): void {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-engineer-coach-'));
@@ -785,5 +785,124 @@ describe('findVsCodeDirs — VS Code Server', () => {
       process.env.USERPROFILE = userProfile;
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('parseTranscriptFile', () => {
+  it('converts transcript events into a session with user/assistant turns', () => {
+    const lines = [
+      JSON.stringify({
+        type: 'session.start',
+        id: 'ev-1',
+        timestamp: '2026-05-15T08:52:24.985Z',
+        data: { sessionId: 'transcript-session-1', version: 1, producer: 'copilot-agent' },
+        parentId: null,
+      }),
+      JSON.stringify({
+        type: 'user.message',
+        id: 'ev-2',
+        timestamp: '2026-05-15T08:52:30.000Z',
+        data: { content: 'Explain the parser architecture.', attachments: [] },
+        parentId: 'ev-1',
+      }),
+      JSON.stringify({
+        type: 'assistant.message',
+        id: 'ev-3',
+        timestamp: '2026-05-15T08:52:35.000Z',
+        data: { content: '', toolRequests: [{ toolCallId: 'tc-1', name: 'list_dir', type: 'function' }] },
+        parentId: 'ev-2',
+      }),
+      JSON.stringify({
+        type: 'tool.execution_start',
+        id: 'ev-4',
+        timestamp: '2026-05-15T08:52:35.100Z',
+        data: { toolCallId: 'tc-1', toolName: 'list_dir', arguments: { path: '/src' } },
+        parentId: 'ev-3',
+      }),
+      JSON.stringify({
+        type: 'tool.execution_complete',
+        id: 'ev-5',
+        timestamp: '2026-05-15T08:52:35.500Z',
+        data: { toolCallId: 'tc-1', success: true },
+        parentId: 'ev-4',
+      }),
+      JSON.stringify({
+        type: 'assistant.message',
+        id: 'ev-6',
+        timestamp: '2026-05-15T08:52:38.000Z',
+        data: { content: 'The parser reads JSONL files line by line.', toolRequests: [] },
+        parentId: 'ev-5',
+      }),
+    ].join('\n');
+
+    withTempFile('transcript-1.jsonl', lines, (filePath) => {
+      const session = parseTranscriptFile(filePath, 'ws-1', 'my-project', 'Local Agent (Server)');
+      expect(session).not.toBeNull();
+      expect(session!.sessionId).toBe('transcript-session-1');
+      expect(session!.workspaceId).toBe('ws-1');
+      expect(session!.workspaceName).toBe('my-project');
+      expect(session!.harness).toBe('Local Agent (Server)');
+      expect(session!.requests).toHaveLength(1);
+
+      const req = session!.requests[0];
+      expect(req.messageText).toBe('Explain the parser architecture.');
+      expect(req.responseText).toBe('The parser reads JSONL files line by line.');
+      expect(req.toolsUsed).toContain('list_dir');
+      expect(req.agentMode).toBe('agent');
+      expect(req.timestamp).toBe(new Date('2026-05-15T08:52:30.000Z').getTime());
+    });
+  });
+
+  it('groups multiple user turns into separate requests', () => {
+    const lines = [
+      JSON.stringify({ type: 'session.start', id: 'e0', timestamp: '2026-05-15T09:00:00.000Z', data: { sessionId: 'multi-turn' }, parentId: null }),
+      JSON.stringify({ type: 'user.message', id: 'e1', timestamp: '2026-05-15T09:00:01.000Z', data: { content: 'First question.' }, parentId: 'e0' }),
+      JSON.stringify({ type: 'assistant.message', id: 'e2', timestamp: '2026-05-15T09:00:02.000Z', data: { content: 'First answer.' }, parentId: 'e1' }),
+      JSON.stringify({ type: 'user.message', id: 'e3', timestamp: '2026-05-15T09:00:05.000Z', data: { content: 'Second question.' }, parentId: 'e2' }),
+      JSON.stringify({ type: 'assistant.message', id: 'e4', timestamp: '2026-05-15T09:00:06.000Z', data: { content: 'Second answer.' }, parentId: 'e3' }),
+    ].join('\n');
+
+    withTempFile('transcript-multi.jsonl', lines, (filePath) => {
+      const session = parseTranscriptFile(filePath, 'ws-2', 'proj', 'Local Agent (Server)');
+      expect(session).not.toBeNull();
+      expect(session!.requests).toHaveLength(2);
+      expect(session!.requests[0].messageText).toBe('First question.');
+      expect(session!.requests[0].responseText).toBe('First answer.');
+      expect(session!.requests[1].messageText).toBe('Second question.');
+      expect(session!.requests[1].responseText).toBe('Second answer.');
+    });
+  });
+
+  it('returns null for a session with no user messages', () => {
+    const lines = [
+      JSON.stringify({ type: 'session.start', id: 'e0', timestamp: '2026-05-15T09:00:00.000Z', data: { sessionId: 'empty-session' }, parentId: null }),
+    ].join('\n');
+
+    withTempFile('transcript-empty.jsonl', lines, (filePath) => {
+      expect(parseTranscriptFile(filePath, 'ws-3', 'proj', 'Local Agent (Server)')).toBeNull();
+    });
+  });
+
+  it('returns null for a file with no parseable events (all lines corrupt)', () => {
+    withTempFile('transcript-corrupt.jsonl', 'not json\nalso not json\n', (filePath) => {
+      expect(parseTranscriptFile(filePath, 'ws-3', 'proj', 'Local Agent (Server)')).toBeNull();
+    });
+  });
+
+  it('deduplicates tool names collected from both toolRequests and tool.execution_start', () => {
+    const lines = [
+      JSON.stringify({ type: 'session.start', id: 'e0', timestamp: '2026-05-15T09:00:00.000Z', data: { sessionId: 'dedup-tools' }, parentId: null }),
+      JSON.stringify({ type: 'user.message', id: 'e1', timestamp: '2026-05-15T09:00:01.000Z', data: { content: 'Do work.' }, parentId: 'e0' }),
+      JSON.stringify({ type: 'assistant.message', id: 'e2', timestamp: '2026-05-15T09:00:02.000Z',
+        data: { content: '', toolRequests: [{ toolCallId: 'tc-1', name: 'read_file', type: 'function' }] }, parentId: 'e1' }),
+      JSON.stringify({ type: 'tool.execution_start', id: 'e3', timestamp: '2026-05-15T09:00:03.000Z',
+        data: { toolCallId: 'tc-1', toolName: 'read_file', arguments: {} }, parentId: 'e2' }),
+      JSON.stringify({ type: 'assistant.message', id: 'e4', timestamp: '2026-05-15T09:00:04.000Z', data: { content: 'Done.' }, parentId: 'e3' }),
+    ].join('\n');
+
+    withTempFile('transcript-dedup.jsonl', lines, (filePath) => {
+      const session = parseTranscriptFile(filePath, 'ws-4', 'proj', 'Local Agent (Server)');
+      expect(session!.requests[0].toolsUsed).toEqual(['read_file']);
+    });
   });
 });

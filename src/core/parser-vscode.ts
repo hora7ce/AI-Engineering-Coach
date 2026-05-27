@@ -156,6 +156,155 @@ function listEditStateFiles(esDir: string): string[] {
   }
 }
 
+function listTranscriptFiles(transcriptDir: string): string[] {
+  try {
+    return fs.readdirSync(transcriptDir, { withFileTypes: true })
+      .filter(e => e.isFile() && e.name.endsWith('.jsonl'))
+      .map(e => path.join(transcriptDir, e.name));
+  } catch {
+    return [];
+  }
+}
+
+interface TranscriptEvent {
+  type: string;
+  id?: string;
+  timestamp?: string;
+  data?: Record<string, unknown>;
+}
+
+/** Parse the raw JSONL text of a transcript file into a list of events, skipping blank/corrupt lines. */
+function parseTranscriptLines(raw: string): TranscriptEvent[] {
+  const events: TranscriptEvent[] = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try { events.push(JSON.parse(trimmed) as TranscriptEvent); } catch { /* skip corrupt line */ }
+  }
+  return events;
+}
+
+/** Build a toolCallId → toolName index from tool.execution_start events. */
+function buildToolNameIndex(events: TranscriptEvent[]): Map<string, string> {
+  const toolNames = new Map<string, string>();
+  for (const ev of events) {
+    if (ev.type === 'tool.execution_start' && ev.data) {
+      const id = ev.data.toolCallId as string | undefined;
+      const name = ev.data.toolName as string | undefined;
+      if (id && name) toolNames.set(id, name);
+    }
+  }
+  return toolNames;
+}
+
+/** Collect tool names referenced in an assistant.message toolRequests array. */
+function collectToolsFromToolRequests(
+  toolRequests: unknown,
+  toolNames: Map<string, string>,
+  out: string[],
+): void {
+  if (!Array.isArray(toolRequests)) return;
+  for (const tr of toolRequests as Array<{ toolCallId?: string; name?: string }>) {
+    const name = tr.name ?? (tr.toolCallId ? toolNames.get(tr.toolCallId) : undefined);
+    if (name) out.push(name);
+  }
+}
+
+/** Walk transcript events and group them into per-turn SessionRequests. */
+function buildRequestsFromTranscriptEvents(
+  events: TranscriptEvent[],
+  toolNames: Map<string, string>,
+): SessionRequest[] {
+  const requests: SessionRequest[] = [];
+  let currentUserMsg: string | null = null;
+  let currentUserTs: number | null = null;
+  let currentUserMsgId: string | null = null;
+  let currentResponseParts: string[] = [];
+  let currentTools: string[] = [];
+
+  const flushTurn = () => {
+    if (currentUserMsg === null) return;
+    requests.push(createRequest({
+      requestId: currentUserMsgId ?? '',
+      timestamp: currentUserTs,
+      messageText: currentUserMsg,
+      responseText: currentResponseParts.join('').trim(),
+      toolsUsed: [...new Set(currentTools)],
+      agentMode: 'agent',
+    }));
+    currentUserMsg = null;
+    currentUserTs = null;
+    currentUserMsgId = null;
+    currentResponseParts = [];
+    currentTools = [];
+  };
+
+  for (const ev of events) {
+    if (ev.type === 'user.message') {
+      flushTurn();
+      currentUserMsg = (ev.data?.content as string | undefined) ?? '';
+      currentUserTs = ev.timestamp ? new Date(ev.timestamp).getTime() : null;
+      currentUserMsgId = ev.id ?? null;
+    } else if (ev.type === 'assistant.message') {
+      const content = (ev.data?.content as string | undefined) ?? '';
+      if (content) currentResponseParts.push(content);
+      // Collect tool names from inline toolRequests; fall back to the
+      // pre-indexed name when only a toolCallId is present.
+      collectToolsFromToolRequests(ev.data?.toolRequests, toolNames, currentTools);
+    } else if (ev.type === 'tool.execution_start') {
+      // Also push from execution_start so tool names appear even when the
+      // assistant.message toolRequests array is absent or empty.
+      const name = (ev.data?.toolName as string | undefined) ?? '';
+      if (name) currentTools.push(name);
+    }
+  }
+  flushTurn();
+
+  return requests;
+}
+
+/**
+ * Parses a Copilot Chat transcript JSONL file (GitHub.copilot-chat/transcripts/*.jsonl).
+ * Each file contains one session; events include session.start, user.message,
+ * assistant.message, tool.execution_start, and tool.execution_complete.
+ */
+export function parseTranscriptFile(
+  filePath: string,
+  wsId: string,
+  wsName: string,
+  harness: string,
+  customInstructionsBytes?: number,
+): Session | null {
+  let raw: string;
+  try { raw = readFile(filePath); } catch (e) {
+    debugCore('parser-vscode', `Cannot read transcript file ${filePath}`, e);
+    return null;
+  }
+
+  const events = parseTranscriptLines(raw);
+  if (events.length === 0) return null;
+
+  const sessionStart = events.find(e => e.type === 'session.start');
+  const sessionId = (sessionStart?.data?.sessionId as string | undefined) || path.basename(filePath, '.jsonl');
+  const sessionStartTs = sessionStart?.timestamp ? new Date(sessionStart.timestamp).getTime() : null;
+
+  const toolNames = buildToolNameIndex(events);
+  const requests = buildRequestsFromTranscriptEvents(events, toolNames);
+
+  if (requests.length === 0) return null;
+
+  return createSession({
+    sessionId,
+    workspaceId: wsId,
+    workspaceName: wsName,
+    harness,
+    requests,
+    creationDate: sessionStartTs,
+    location: 'panel',
+    customInstructionsBytes,
+  });
+}
+
 function countLinesAdded(edits: { text?: string }[] | undefined): number {
   let linesAdded = 0;
   for (const edit of (edits || [])) {
@@ -270,6 +419,22 @@ export function processWorkspaceEntry(
     }
   }
 
+  // Transcript format: workspaceStorage/<hash>/GitHub.copilot-chat/transcripts/*.jsonl
+  const transcriptDir = path.join(entryPath, 'GitHub.copilot-chat', 'transcripts');
+  for (const transcriptFile of listTranscriptFiles(transcriptDir)) {
+    const session = parseTranscriptFile(transcriptFile, wsId, wsName, harness, customInstructionsBytes);
+    if (session) {
+      sessions.push(session);
+      sessionSourceIndex.set(session.sessionId, {
+        kind: 'vscode-session-file',
+        filePath: transcriptFile,
+        workspaceId: wsId,
+        workspaceName: wsName,
+        harness,
+      });
+    }
+  }
+
   const eventsFile = path.join(entryPath, 'events.jsonl');
   const cliSession = parseCLIEventsFile(eventsFile, wsId, wsName, customInstructionsBytes);
   if (cliSession) {
@@ -318,9 +483,10 @@ export async function processWorkspaceEntryAsync(
   }
 
   const chatFiles = listChatSessionFiles(path.join(entryPath, 'chatSessions'));
+  const transcriptFiles = listTranscriptFiles(path.join(entryPath, 'GitHub.copilot-chat', 'transcripts'));
   const editStateFiles = listEditStateFiles(path.join(entryPath, 'chatEditingSessions'));
-  const totalUnits = Math.max(1, chatFiles.length + editStateFiles.length);
-  const chatEvery = chunkInterval(chatFiles.length);
+  const totalUnits = Math.max(1, chatFiles.length + transcriptFiles.length + editStateFiles.length);
+  const chatEvery = chunkInterval(chatFiles.length + transcriptFiles.length);
   const editEvery = chunkInterval(editStateFiles.length);
   let completed = 0;
 
@@ -347,6 +513,30 @@ export async function processWorkspaceEntryAsync(
     }
     // Always yield after each file to keep the event loop responsive,
     // especially for workspaces with many large session files.
+    await yieldToLoop();
+  }
+
+  for (let i = 0; i < transcriptFiles.length; i++) {
+    const session = parseTranscriptFile(transcriptFiles[i], wsId, wsName, harness, customInstructionsBytes);
+    if (session) {
+      sessions.push(session);
+      sessionSourceIndex.set(session.sessionId, {
+        kind: 'vscode-session-file',
+        filePath: transcriptFiles[i],
+        workspaceId: wsId,
+        workspaceName: wsName,
+        harness,
+      });
+    }
+    completed++;
+    if (shouldReportChunk(chatFiles.length + i, chatFiles.length + transcriptFiles.length, chatEvery)) {
+      onProgress?.({
+        wsName,
+        detail: `transcript ${i + 1}/${transcriptFiles.length}`,
+        completed,
+        total: totalUnits,
+      });
+    }
     await yieldToLoop();
   }
 
